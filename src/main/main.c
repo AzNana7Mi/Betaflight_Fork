@@ -121,7 +121,7 @@ int main(int argc, char * argv[])
     }
 #endif
 
-#ifdef CONFIG_IN_FILE
+#ifdef CONFIG_IN_FILE //只在simulator里面使用
     {
         const char *configFile = targetGetConfigFile();
         if (configFile) {
