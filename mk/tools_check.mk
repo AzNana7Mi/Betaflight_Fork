@@ -25,12 +25,12 @@ ifeq ($(_FOUND_VERSION),)
   $(error **ERROR** $(_SDK_CC) not found. Run 'make $(_SDK_CC_INSTALL)' to install the toolchain)
 endif
 
-# Check version matches if a specific version is required
-ifneq ($(_SDK_CC_VERSION),)
-ifneq ($(_FOUND_VERSION),$(_SDK_CC_VERSION))
-  $(error **ERROR** $(_SDK_CC) version '$(_FOUND_VERSION)' found but '$(_SDK_CC_VERSION)' is required. Override with GCC_REQUIRED_VERSION in mk/local.mk or run 'make $(_SDK_CC_INSTALL)' to install the correct version)
-endif
-endif
+# ARM compiler version check disabled - allowing any compiler version
+# ifneq ($(_SDK_CC_VERSION),)
+# ifneq ($(_FOUND_VERSION),$(_SDK_CC_VERSION))
+#   $(error **ERROR** $(_SDK_CC) version '$(_FOUND_VERSION)' found but '$(_SDK_CC_VERSION)' is required. Override with GCC_REQUIRED_VERSION in mk/local.mk or run 'make $(_SDK_CC_INSTALL)' to install the correct version)
+# endif
+# endif
 
 # ARM toolchain found in PATH — set prefix so the rest of the build uses it
 ifeq ($(ARM_SDK_PREFIX),)

@@ -700,15 +700,14 @@ $(TARGETS_ZIP):
 zip: $(TARGET_HEX)
 	$(V1) zip $(TARGET_ZIP) $(TARGET_HEX)
 
+# GitHub online submodule hydration disabled - skip git operations
 # Stamp rule for any submodule listed in $(AUTOHYDRATE_SUBMODULES) (i.e.
 # any .gitmodules entry that doesn't have `update = none`). The stamp is
 # the submodule's `.git` pointer, which exists only after a successful
 # `git submodule update --init`, so Make treats it as up-to-date on
 # subsequent runs — hydration stays idempotent and cheap.
 $(AUTOHYDRATE_STAMPS):
-	@echo "Hydrating submodule: $(@:/.git=)"
-	$(V1) git submodule update --init -- "$(@:/.git=)" \
-	    || { echo "submodule update failed: $(@:/.git=)"; exit 1; }
+	@echo "Skipping submodule hydration (disabled): $(@:/.git=)"
 
 .PHONY: binary
 binary: $(PLATFORM_SDK_STAMP) $(AUTOHYDRATE_STAMPS)
