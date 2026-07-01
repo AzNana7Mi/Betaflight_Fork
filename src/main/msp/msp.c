@@ -3422,7 +3422,7 @@ static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t cmdMSP, 
             sbufReadU8(src);
             sbufReadU8(src);
 #endif
-            sbufReadU8(src); // was abs_control_gain
+            sbufReadU8(src); // was     abs_control_gain
 #if defined(USE_THROTTLE_BOOST)
             currentPidProfile->throttle_boost = sbufReadU8(src);
 #else
