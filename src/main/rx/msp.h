@@ -22,6 +22,10 @@
 
 struct rxConfig_s;
 struct rxRuntimeState_s;
+//patched 2026.6.1 new feature
+//start
+bool rxMspIsRcChannelRefresh(uint8_t chan);
+//end
 float rxMspReadRawRC(const rxRuntimeState_t *rxRuntimeState, uint8_t chan);
 void rxMspInit(const struct rxConfig_s *rxConfig, struct rxRuntimeState_s *rxRuntimeState);
 void rxMspFrameReceive(const uint16_t *frame, int channelCount);

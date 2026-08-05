@@ -36,7 +36,29 @@
 static uint16_t mspFrame[MAX_SUPPORTED_RC_CHANNEL_COUNT];
 static bool rxMspFrameDone = false;
 static bool rxMspOverrideFrameDone = false;
+//patched 2026.6.1
+//2026.8.13
+//start
 
+static bool rxMspRcFrameEverReceived = false;        // 是否收到过任何 MSP RC 帧
+static timeMs_t lastRxMspRcFrameMs = 0;              // 最近一帧到达时刻
+static uint8_t lastRxMspRcFrameChannelCount = 0;     // 最近一帧的通道数
+
+//  300 ms 窗口（约 5Hz MSP 速率的余量）
+#define RX_MSP_RC_FRAME_FRESH_MS 300
+bool rxMspIsRcChannelRefresh(uint8_t chan)
+{
+    if (!rxMspRcFrameEverReceived)
+    {
+        return false; // 从未收到msp帧
+    }
+    if (chan >= lastRxMspRcFrameChannelCount)
+    {
+        return false; //未覆盖通道
+    }
+    return (millis() - lastRxMspRcFrameMs) <= RX_MSP_RC_FRAME_FRESH_MS; //300ms之内
+}
+//end
 float rxMspReadRawRC(const rxRuntimeState_t *rxRuntimeState, uint8_t chan)
 {
     UNUSED(rxRuntimeState);
@@ -56,7 +78,12 @@ void rxMspFrameReceive(const uint16_t *frame, int channelCount)
     for (int i = channelCount; i < MAX_SUPPORTED_RC_CHANNEL_COUNT; i++) {
         mspFrame[i] = 0;
     }
-
+    // patched 2026.6.1 new feature
+    // start
+    lastRxMspRcFrameMs = millis();
+    lastRxMspRcFrameChannelCount = channelCount;
+    rxMspRcFrameEverReceived = true;
+    // end
     rxMspFrameDone = true;
     rxMspOverrideFrameDone = true;
 }
