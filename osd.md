@@ -316,3 +316,138 @@ FC 的 UART(TX)  ──MSP_DISPLAYPORT 报文──▶  支持 MSP OSD 的模拟
 - `src/main/msp/msp_protocol.h:226` `#define MSP_DISPLAYPORT 182`
 - `src/config/configs/AIRB/AIRBOTSUPERF4V2/config.h` `USE_MSP_DISPLAYPORT_FONT` + `MSP_DISPLAYPORT_UART`
 
+
+---
+
+## 11. 专题分析：MSP OSD 在地面站不开启对应 UART 时也能识别并输出
+
+> 现象：某 BF 飞控产品（源码疑似被改动过）使用 MSP OSD 时，即使在地面站/配置器的"端口"页没有勾选该 UART 的 VTX MSP/MSP 功能，OSD 仍能被识别并输出。
+
+### 11.1 原版 Betaflight 的正常要求
+
+MSP DisplayPort 必须有一条"挂载"串口，链路如下：
+
+```
+config.c validateAndFixConfig()
+  └─ 扫描所有端口: functionMask 同时含 FUNCTION_VTX_MSP|FUNCTION_MSP 的第一个端口
+       └─ displayPortMspSetSerial(该端口)          // 保存到 static displayPortSerial
+io/displayport_msp.c
+  └─ 每次显示原语 → mspSerialPush(displayPortSerial, MSP_DISPLAYPORT(182), ...)
+msp_serial.c mspSerialPush()
+  └─ 只推送到 identifier == displayPortSerial 的端口；SERIAL_PORT_NONE 时不推送
+```
+
+**结论**：原版固件中，"输出"到眼镜/VTX 的 MSP OSD 帧**必须**依赖该端口被勾选 `VTX MSP` + `MSP`（EEPROM 里存了 functionMask）。
+
+### 11.2 "识别"和"输出"是两回事
+
+- **识别（MSP_OSD_CONFIG 上报为 MSP 设备）**：`init.c` 在 `video_system == HD` 或 `display_port_device = MSP`/AUTO 且无 MAX7456 时就把 `osdDisplayPortDevice` 设为 MSP。这个判断**不依赖任何 UART 配置**，USB 上就能查询到——所以"不开启 UART 也能识别"对原版固件也是成立的。
+- **输出（实际推送 OSD 帧）**：才需要 `displayPortSerial` 有效。
+
+### 11.3 为什么"不开启 UART 也能输出"？几种可能
+
+| 情形 | 机制 | 是否需改源码 |
+| --- | --- | --- |
+| A. 出厂默认配置 | 目标固件定义了 `MSP_DISPLAYPORT_UART`，`pgResetFn_serialConfig`（serial.c:361）在**配置复位**时把该端口 functionMask 强制为 `FUNCTION_VTX_MSP|FUNCTION_MSP`。若用户从未在配置器里保存过端口配置（或EEPROM无效/被重置），该端口本来就"开着的" | **不需要**改源码 |
+| B. 启动时强制 | 固件在 `serialInit()` 或 `validateAndFixConfig()` 每次开机**无条件**重写该端口的 functionMask（不再等 EEPROM） | 需要小改（如把 serial.c:361 移到开机路径） |
+| C. 推送不按端口过滤 | `mspSerialPush` 被改成 `SERIAL_PORT_ALL`，或 `displayPortMspSetSerial` 被硬编码到某个 UART | 需要改 msp_serial.c / displayport_msp.c / config.c |
+| D. 目标本身无此端口 | 完全靠 `MSP_DISPLAYPORT_UART` 直连（如 AIRBOTSUPERF4V2 的 USART8） | 目标配置里定义即可 |
+
+**注意**：原版机制下，只要用户在配置器里"保存"过一次端口设置（把 VTX MSP 勾掉），EEPROM 覆盖默认值后，**情形 A 失效**。若此时 OSD 仍然输出，则基本可以断定是 **B 或 C**——即该产品固件在开机/推送环节做了强制处理。
+
+### 11.4 如何验证 / 定位改动
+
+1. **实验法**：在配置器端口页把可能相关的 UART 的 `VTX MSP` 全部取消、保存并重启 → 若 OSD 仍正常输出，说明固件在开机时强制覆盖了 functionMask（情形 B/C）。
+2. **观察法**：连接配置器查看 OSD 页显示设备类型。若显示 "MSP" 且 `displayport_msp_*` 参数可调，说明 `displayPortDevice` 已是 MSP。
+3. **对照 diff 法**：把产品固件源码与官方 BF 对照这几个文件：
+   - `src/main/io/serial.c`（`#ifdef MSP_DISPLAYPORT_UART` 强制段是否被挪到开机路径）
+   - `src/main/config/config.c`（`validateAndFixConfig` 是否改为"强制写 functionMask"）
+   - `src/main/msp/msp_serial.c`（`mspSerialPush` 是否放宽端口过滤）
+   - `src/main/io/displayport_msp.c`（`displayPortMspSetSerial`/`displayPortMspInit` 是否硬编码端口）
+   - 目标配置（是否定义 `MSP_DISPLAYPORT_UART`）
+4. **本仓库结论**：本 fork（含 RP_F405_BT 相关提交）在 serial.c / config.c / msp_serial.c / displayport_msp.c 上**与上游一致**，没有任何强制覆盖端口的改动。若你的产品基于本仓库而出现上述现象，说明产品固件相对本仓库另有修改（或该目标本身定义了 `MSP_DISPLAYPORT_UART`）。
+
+---
+
+## 12. MAX7456 主板硬件接线
+
+### 12.1 芯片在板上的三组信号
+
+| 组 | 信号 | 说明 |
+| --- | --- | --- |
+| SPI 控制 | SCK / MOSI(SDIN) / MISO(SDOUT) / CS | 接到 MCU 的某个 SPI 总线，FC 通过 SPI 写"字符索引"、读状态、刷字库 |
+| 视频环 | VIN（摄像头视频进）、VOUT（视频出→VTX） | **关键**：模拟摄像头必须先进 MAX7456，MAX7456 把字符叠加后再输出给 VTX |
+| 电源/复位 | VCC(3.3V) / GND / RESET#（可省） | 3.3V 供电；有些板把 RESET 与 MCU 的 IO 相连做硬复位 |
+
+**视频链路**：
+
+```
+模拟摄像头 ──CVBS──▶ [MAX7456 VIN] ──(字符叠加)── [VOUT] ──CVBS──▶ 模拟图传VTX ──射频──▶ 眼镜
+```
+
+这就是"摄像头视频线进飞控板、VTX 视频线与摄像头不直连"的标准原因——**FC 板故意把视频"环"进 OSD 芯片再环出去**。
+
+### 12.2 目标固件里的引脚配置（示例）
+
+```c
+// src/config/configs/FPVM/BETAFLIGHTF4/config.h
+#define USE_MAX7456
+#define MAX7456_SPI_CS_PIN   PB12     // 片选
+#define MAX7456_SPI_INSTANCE SPI2     // 挂在 SPI2 上
+// SPI2_SCK=PB13  SPI2_SDI(MISO)=PB14  SPI2_SDO(MOSI)=PB15
+
+// src/config/configs/FPVM/XRACERF4/config.h
+#define MAX7456_SPI_CS_PIN   PA15
+#define MAX7456_SPI_INSTANCE SPI3
+```
+
+运行时参数（`src/main/pg/max7456.c`）：`max7456Config`（csTag、spiDevice、clockConfig 半/额定/双倍速、preInitOPU）。
+
+### 12.3 常见问题
+
+- **必须走 SPI，不能走 UART**：MAX7456 是 SPI 从机，不支持 MSP。如果 FC 没有引出 MAX7456 的 SPI 引脚（飞线到 MCU 的 SPI），就无法外接 MAX7456；外接"MINIMOSD"之类模块走的是串口 MWOSD 协议（另一套方案，非本驱动）。
+- **视频同步**：VIN 需给有效的 PAL/NTSC CVBS 信号；芯片用 STAT 寄存器检测制式（`max7456ReInit` 读取 VIN 状态），无信号时会退化为默认 PAL。
+- **供电与纹波**：3.3V 供电需干净；视频走线要短、远离开关电源（避免画面抖动）。
+- **为何"看着没有芯片"**：老式 TQFP-48 封装很大；但 MAX7456 也有 TSSOP-28 等小封装，且很多 AIO 板把 OSD 芯片藏在屏蔽罩/板背面。若板上视频环（Camera→FC→VTX）成立却没有 MAX7456，参见下一节（MSP OSD 芯片 / FB_OSD 等替代方案）。
+
+---
+
+## 13. 专题分析：板上没有 MAX7456，但摄像头视频线接入飞控板、VTX 未与摄像头直连
+
+> 现象：飞控板上看不出大封装的 MAX7456，但摄像头视频线确实进了飞控板；实测 VTX 的视频输入线没有与摄像头直接相连。
+
+### 13.1 结论：视频环 ≠ 一定有 MAX7456，OSD 可以由"小型 MSP OSD 芯片"完成
+
+**摄像头 → 飞控板 → VTX 的"视频环"结构，本质上只说明板上存在一个"视频叠加/处理节点"**，并不限定是 MAX7456。既然板上没有大封装 MAX7456，最可能的替代实现是：
+
+```
+模拟摄像头 ──CVBS──▶ [小型 MSP OSD 芯片 (VIN)] ──(MCU字符叠加)── [VOUT] ──CVBS──▶ 模拟图传VTX
+                          ▲
+                          │ 串口(MSP_DISPLAYPORT 报文)
+                          │
+                    FC 主控 STM32 (UART 引脚直连芯片)
+```
+
+**这正是 MSP DisplayPort 的典型模拟应用**：
+- 芯片体积远小于 TQFP-48 的 MAX7456（常为 SSOP/QFN/SOP 小封装，容易被当作"稳压/电源"器件忽略）；
+- 它内部有"视频同步分离 + 字符点阵 + 视频混合"电路，接收 FC 通过 UART 发来的 `MSP_DISPLAYPORT` 文本指令，自行把字符叠加进模拟视频；
+- 代码层面的对应物：`USE_MSP_DISPLAYPORT_FONT`（MSP 上传字库，提交 #14391）、`OSD_FLAGS_OSD_HARDWARE_AIRBOT_THEIA_OSD`（MSP OSD 器件标志）。这类产品即"Airbot Theia OSD"及同类 MSP 芯片。
+
+### 13.2 与前面现象的闭环
+
+- 为什么"地面站不开启 UART 也能识别并输出 OSD"？因为该 MSP OSD 芯片在**硬件上已固定接到某个 UART**（目标固件 `MSP_DISPLAYPORT_UART` 或固件强制），配置器端口页是否勾选不影响这条物理链路；而"识别为 MSP"本来就不依赖端口配置（见第 11 节）。
+- 为什么"没有 MAX7456"？因为它根本不基于 MAX7456——字符渲染在 MSP OSD 芯片内部完成，不需要大封装 SPI 芯片。
+
+### 13.3 如何进一步确认（按优先级）
+
+1. **用眼睛找小芯片**：沿摄像头 VIN 焊盘和 VTX VOUT 焊盘之间找小封装 IC（SSOP/SOP/QFN，常见 8~28 脚），并确认其附近有 2~4 根走线连到 MCU（UART TX/RX + 电源）。
+2. **看地面站 OSD 页设备类型**：若显示 "MSP" 且能正常预览/输出，基本坐实是 MSP OSD 芯片。
+3. **CLI 验证**：`get osd_framerate_hz` / `get display_port_device`，或 `status` 看 `OSD: MSP`。
+4. **示波器量 UART**：OSD 工作时可看到该 UART TX 上有 `$M.>` 头的 MSP 帧（MSP_DISPLAYPORT 182）。
+5. **对照目标配置**：查产品固件目标是否定义 `MSP_DISPLAYPORT_UART` / `USE_MSP_DISPLAYPORT_FONT`（对应仓库 `src/config/configs/AIRB/AIRBOTSUPERF4V2/config.h` 的写法）。
+6. **少数情况（可排除）**：MAX7456 的 QFN/TSSOP 小封装版藏在屏蔽罩或板背面——若实测 VTX 视频与摄像头不直连且 OSD 存在，可用金属屏蔽罩下方/板背是否有 30 列字符网格 OSD 来判断；也可看 `status` 里 OSD 设备是 MAX7456 还是 MSP。
+
+### 13.4 对本仓库的说明
+
+本 fork 的 `FB_OSD`（framebuffer OSD，RP2350/PICO 目标）是另一种"无 MAX7456 也能输出视频+OSD"的实现，但它在 FC 内部做像素级渲染，通常用于自输出视频的板子；若你的板是常见 STM32F4 AIO（摄像头+模拟VTX），最合理的就是**第 13.1 节的 MSP OSD 芯片方案**。
+
