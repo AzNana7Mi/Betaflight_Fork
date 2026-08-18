@@ -32,12 +32,6 @@
 // accept 64 bytes and use the extra 10 bytes for metadata.
 #define OSD_CHAR_BYTES 64
 
-#define OSD_CHARACTER_COLOR_BLACK 0
-#define OSD_CHARACTER_COLOR_TRANSPARENT 1
-#define OSD_CHARACTER_COLOR_WHITE 2
-
-// 3 is unused but it's interpreted as transparent by all drivers
-
 // Video Character Display parameters
 
 typedef enum {
