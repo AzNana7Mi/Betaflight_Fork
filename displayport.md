@@ -291,3 +291,109 @@ $M> 03 B6 04 6D            <- DRAW_SCREEN(4)
 - **回退语义**：停止发送后 300ms 内仍是"最后一帧 MSP 值"（本 fork 行为，见 `msp_override_update.md`），如需"失联立即回退遥控器"，需调整 `RX_MSP_RC_FRAME_FRESH_MS` 或接入 `rxMspIsRcChannelRefresh()` 判定；
 - **与 OSD 共口**：若接管和 OSD 走同一串口，FC 侧该口须同时带 `FUNCTION_MSP`（MSP 接管）与 `FUNCTION_VTX_MSP`（OSD 推送），注意显示端也要按 cmd 号过滤（OSD 只处理 182，接管只处理 200）。
 
+
+---
+
+## 11. 专题：自动驾驶与 OSD 共用一串口 —— 方案A：改固件在 OSD 流中附带 RC/高度遥测
+
+### 11.1 可行性结论
+
+**可以，且推荐在现有 `MSP_DISPLAYPORT(182)` 帧里新增一个子命令**（例如 `MSP_DP_RC_AND_ALT = 8`），在每帧 OSD 心跳时顺带推一条"快照"。理由：
+
+- FC 侧数据现成：`rcData[]`（4 主通道 1000~2000us）、`getEstimatedAltitudeCm()`（cm）、`getAltitudeDerivative()`（cm/s）；
+- 上位机本来就要解析 182，多处理一个子命令即可；不支持该子命令的老设备会忽略，天然向后兼容；
+- 推送节奏与 OSD 帧同步（`osd_framerate_hz` 默认 12Hz），无需新任务。若嫌 12Hz 低，可把调用点改到更高频路径（见 11.4）。
+
+### 11.2 修改点（精确到文件行）
+
+**① 加子命令枚举 —— `src/main/io/displayport_msp.h:41`（`MSP_DP_COUNT` 之前）**
+
+```c
+    MSP_DP_RC_AND_ALT = 8,  // FC→设备扩展: 遥控通道(4×u16) + 高度(i32 cm) + 垂速(i16 0.1cm/s)
+    MSP_DP_COUNT,
+```
+
+**② 新增推流函数并挂到 heartbeat —— `src/main/io/displayport_msp.c`（heartbeat() 位于 :65-75）**
+
+```c
+// 在 heartbeat() 之前新增（需 #include "fc/rc_controls.h" "rx/rx.h" "flight/position.h" "common/maths.h"）
+static int pushRcAndAlt(displayPort_t *displayPort)
+{
+    uint8_t buf[1 + 8 + 4 + 2];
+    uint8_t *p = buf;
+    *p++ = MSP_DP_RC_AND_ALT;
+    // 4 主通道: rcData[ROLL..THROTTLE], 单位 us (1000~2000), u16 LE
+    for (int i = 0; i < 4; i++) {
+        uint16_t v = (uint16_t)lrintf(rcData[ROLL + i]);
+        *p++ = v & 0xFF; *p++ = (v >> 8) & 0xFF;
+    }
+    // 高度: cm, i32 LE
+    int32_t alt = getEstimatedAltitudeCm();
+    memcpy(p, &alt, 4); p += 4;
+    // 垂直速度: cm/s, 分辨率 0.1, i16 LE (也可换 getEstimatedVario())
+    int16_t vs = (int16_t)lrintf(getAltitudeDerivative() * 10.0f);
+    memcpy(p, &vs, 2);
+    return output(displayPort, MSP_DISPLAYPORT, buf, sizeof(buf));
+}
+```
+
+```c
+// 在 heartbeat()（:65-75）末尾追加调用：
+static int heartbeat(displayPort_t *displayPort)
+{
+    uint8_t subcmd[] = { MSP_DP_HEARTBEAT };
+    output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd));
+    pushRcAndAlt(displayPort);      // ← 新增：每帧 OSD 随推一次
+    return 0;
+}
+```
+
+**调用链（无需改调度器）**：`TASK_OSD → osd.c:1437 OSD_STATE_UPDATE_HEARTBEAT → displayHeartbeat() → displayport_msp.c heartbeat() → pushRcAndAlt()`，即每帧 OSD（默认 12Hz）推一次。
+
+**③ 上位机侧解析**：在 182 的子命令分发里加 `case 8`：读 8B（4×u16 LE，通道 us）+ 4B（i32 LE，cm）+ 2B（i16 LE，0.1cm/s）。
+
+> 数据接口出处：`rx/rx.h:87`（`extern float rcData[]`）、`fc/rc_controls.h:30`（`ROLL=0,PITCH,YAW,THROTTLE`）、`flight/position.h:52`（`getEstimatedAltitudeCm`）、`flight/position.h:46`（`getAltitudeDerivative`）。若想推摇杆归一化值 `rcCommand[]`（-500~+500）代替原始 us，改数据源即可。
+
+### 11.3 其它方案对比
+
+| 方案 | 改动量 | 优缺点 |
+| --- | --- | --- |
+| **A. 182 子命令附带（推荐）** | 1 个枚举 + 1 个函数 + 1 行调用 | 最小改动；时序与 OSD 同步；向后兼容 |
+| B. 新增自定义 MSP 命令（如 251~254 保留段）由上位机轮询 | msp.c 加 case + 上位机定时请求 | 更"规范"的请求/响应；但多一跳、受调度时间片影响、无实时性保证 |
+| C. 复用现成 MSP_ALTITUDE 等命令轮询 | 0（FC 侧） | 不需要改固件；但同样是轮询、占用双向带宽、无同步 |
+
+**推荐 A**：自动驾驶需要"当前姿态输入 + 高度 + 垂速"与 OSD 同帧到达，A 方案天然满足。
+
+---
+
+## 12. 专题：自动驾驶与 OSD 共用一串口 —— 方案B：用 MSP_SET_RAW_RC 设通道
+
+### 12.1 可行性结论：**可以，无需改固件**
+
+- 该串口带 `FUNCTION_MSP`，FC 的 MSP 处理器对 `MSP_SET_RAW_RC(200)` **对所有 MSP 端口生效**（`msp.c:2887 case MSP_SET_RAW_RC`）；
+- 上位机只要发 `$M<`（或 `$X<`）帧：`cmd=200` + `N×u16(LE)` 通道（8 通道=16B，最多 18 通道=36B）；
+- FC 路径：`msp.c:2887 → rxMspFrameReceive()（rx/msp.c:71）→ mspFrame[] → RX 任务 / override`。
+
+### 12.2 生效前提（二选一）
+
+1. **常规接管**：配置器把 `serialrx_provider = MSP`（FC 的 RC 源就是 MSP，所有通道都来自你）；
+2. **本 fork 特性（推荐）**：`BOXMSPOVERRIDE` 模式 + `msp_override_channels_mask`——只接管你屏蔽的通道，未屏蔽通道继续走遥控器（`rx/msp_override.c:30-38`，`rx.c:630/728`）。
+
+### 12.3 共口注意
+
+- 同口混流：**收** OSD（`$M>` cmd=182）、**发** 接管（`$M<` cmd=200），按 cmd 号过滤即可，方向天然区分；
+- 新鲜度：`rx/msp.c:48` `RX_MSP_RC_FRAME_FRESH_MS = 300ms`，超时回退（详见 §10）；
+- 带宽估算：OSD 推送 ~34B×12Hz ≈ 400B/s；`SET_RAW_RC` 8 通道 ~23B，50Hz ≈ 1150B/s；合计 ~1550B/s，115200 波特率下约 13% —— **50Hz + 115200 足够，追求更低延迟可 100Hz + 230400**。
+
+---
+
+## 13. 字符集：WRITE_STRING 是 ASCII 吗？
+
+**结论：不是纯 ASCII，是"可打印 ASCII + OSD 符号"的 8bit 字节流。**
+
+- `0x20 ~ 0x7E`：与标准可打印 ASCII 一致（`0x20` 空格，字母/数字/标点正常渲染）；
+- `0x00 ~ 0x1F` 与 `0x7F ~ 0xFF`：**OSD 自定义符号字形**（`drivers/osd_symbols.h` 共 100+ 个 `SYM_*`），例如：
+  `SYM_RSSI=0x01`、`SYM_VOLT=0x06`、`SYM_BLANK=0x20`、`SYM_ALTITUDE=0x7F`、`SYM_AH_BAR9_0=0x80`、`SYM_BATT_FULL=0x90`、`SYM_MAIN_BATT=0x97`、`SYM_END_OF_FONT=0xFF`；
+- 渲染由 **attr 的 font bank 位（bits0-1，默认 bank=severity）** 决定用哪套 256 字符字库；
+- **无 UTF-8/宽字符/转义**：字节按字库原样查表渲染。上位机若不自带与 BF 默认字库一致的字形，可配合 `FONTCHAR_WRITE(7)`（§4.5）接收字库，否则至少保证 ASCII 段可读、符号段用占位符。
+
