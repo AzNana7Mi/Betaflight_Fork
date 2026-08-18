@@ -35,20 +35,60 @@
 
 ## 2. MSP v1 帧封装（FC 推送方向）
 
-FC 用 `mspSerialPush(port, cmd, payload, len, MSP_DIRECTION_REPLY, MSP_V1)` 编码（`msp_serial.c mspSerialEncode`）：
+FC 用 `mspSerialPush(port, cmd, payload, len, MSP_DIRECTION_REPLY, MSP_V1)` 编码（`msp_serial.c mspSerialEncode`）。**当前固件把 DisplayPort 推送固定编码为 MSP v1**（`displayport_msp.c output()` 硬编码 `MSP_V1`），上位机接收 OSD 必须能解析 v1；但上位机**发往 FC 的命令（反向通道）三种版本都支持**（FC 的 MSP 解析器同时接受 `$M` v1 / `$M` v2-over-v1 / `$X` v2-native）。
+
+### 2.1 MSP v1 帧（当前 OSD 推送用的格式）
 
 ```
 ┌──────┬──────┬──────┬──────┬──────┬────────────────────────┬──────────┐
-│ '$'  │ 'M'  │ '>'  │ size │ cmd  │ payload                │ checksum │
-│ 0x24 │ 0x4D │ 0x3E │ 1B   │ 0xB6 │ 子命令 + 参数          │ 1B       │
+│ '$'  │ 'M'  │ 方向 │ size │ cmd  │ payload                │ checksum │
+│ 0x24 │ 0x4D │1B    │ 1B   │ 0xB6 │ 子命令 + 参数          │ 1B       │
 └──────┴──────┴──────┴──────┴──────┴────────────────────────┴──────────┘
 ```
 
-- 魔数 `$M` + 方向字节：FC→设备固定 `>`（0x3E；若 FC 内部出错会变 `!`，正常不会）；
+- 方向字节：FC→设备固定 `>`（0x3E；FC 内部出错时变 `!` 0x21）；上位机→FC 用 `<`（0x3C）；
 - `size` = payload 字节数（WRITE_STRING 最多 30+4=34，不会触发 JUMBO 头）；
 - `cmd` = `MSP_DISPLAYPORT` = 182 = 0xB6；
 - `checksum` = `size XOR cmd XOR payload[0] XOR payload[1] ...`（MSP v1 校验）；
-- 这是**标准 MSP v1**，任何 MSP 库（或手写解析器）都能解析。
+
+
+### 2.2 MSP v2 帧头格式（上位机→FC 可用；OSD 推送目前不用）
+
+**MSP v2-native（`$X` 魔数）**：
+
+```
+┌──────┬──────┬──────┬──────┬──────────┬──────────┬───────────────────────┬──────────┐
+│ '$'  │ 'X'  │ 方向 │ flags│ cmd(LE16)│ size(LE) │ payload               │ crc8     │
+│ 0x24 │ 0x58 │1B    │ 1B   │ 2B       │ 2B       │ ...                   │ 1B       │
+└──────┴──────┴──────┴──────┴──────────┴──────────┴───────────────────────┴──────────┘
+```
+
+- 方向字节同上：FC→上位机 `>`/`!`，上位机→FC `<`；
+- `flags`：请求/回复标志，本实现中**回复会把请求的 flags 原样回显**（`msp_serial.c:429 reply.flags = cmdFlags`），常规填 0；
+- `cmd`、`size` 为小端 16 位 → v2 可携带任意数量/任意命令号；
+- `crc8` = `crc8_dvb_s2(flags, cmd16, size16, payload...)`。
+
+**MSP v2-over-v1（`$M` 魔数 + v1 cmd=255 封装）**：
+
+```
+┌──────┬──────┬──────┬──────┬─────────┬──────────┬──────────┬──────────┬─────────┬──────────┬──────────┐
+│ '$'  │ 'M'  │ 方向 │ size │ v1 cmd  │ flags    │ cmd(LE16)│ size(LE) │ payload │ crc8     │ cs1      │
+│ 0x24 │ 0x4D │1B    │ 1B   │ 255(0xFF)│ 1B       │ 2B       │ 2B       │ ...     │ 1B       │ 1B       │
+└──────┴──────┴──────┴──────┴─────────┴──────────┴──────────┴──────────┴─────────┴──────────┴──────────┘
+```
+
+- `size` = `5 + payload_len + 1`（v2 头 + payload + crc8 字节）；`v1 cmd` = `MSP_V2_FRAME_ID` = 255；
+- `crc8` 只覆盖 v2 头+payload；外层 `cs1` = `XOR(size, 255, v2头, payload, crc8)`（两重校验）。
+
+### 2.3 帧头对比速查表（重点）
+
+| 协议 | 魔数 | 上位机→FC | FC→上位机(正常) | FC→上位机(出错) | 命令号宽度 | 校验 |
+| --- | --- | --- | --- | --- | --- | --- |
+| MSP v1 | `$M` | `$M<` | `$M>` | `$M!` | 1B (cmd≤254) | XOR |
+| MSP v2-over-v1 | `$M`+v1 cmd=255 | `$M<...` | `$M>...` | `$M!...` | 2B LE | CRC8(XOR外层) |
+| MSP v2-native | `$X` | `$X<` | `$X>` | `$X!` | 2B LE | CRC8 |
+
+**结论：上位机→FC 与 FC→上位机的帧头**除了方向字节（`<` vs `>`/`!`）不同之外结构完全对称**。解析器只需识别"方向字节"即可区分收发；`$X` 与 `$M` 魔数用于区分 v1/v2，方向字节不参与校验计算（v1 校验从 size 开始）。
 
 ---
 
@@ -202,4 +242,52 @@ $M> 03 B6 04 6D            <- DRAW_SCREEN(4)
 | 串口挂载 | `src/main/config/config.c:566-578`；`src/main/io/serial.c:361`（`MSP_DISPLAYPORT_UART`） |
 | 字库参数 | `src/main/pg/displayport_profiles.c`（`fontSelection[severity]=severity` 默认） |
 | 字符尺寸 | `src/main/drivers/osd.h`（12×18，2bit/px，`OSD_CHAR_BYTES=64`，可见 54B） |
+
+
+---
+
+## 9. 专题：MSP OSD 能否用 MSP v2？
+
+**结论：当前固件 OSD 推送固定是 MSP v1；想用 v2 必须改固件。**
+
+| 方向 | 当前实现 | 能否用 v2 |
+| --- | --- | --- |
+| FC → 上位机（OSD 推送） | `displayport_msp.c output()` 硬编码 `mspSerialPush(..., MSP_V1)` | ❌ 不能，除非改源码 |
+| 上位机 → FC（命令/查询/接管） | FC 解析器接受 v1 / v2-over-v1 / v2-native | ✅ 三种都可以 |
+
+- 想改 v2：把 `displayport_msp.c:62` 的 `MSP_V1` 改为 `MSP_V2_OVER_V1` 或 `MSP_V2_NATIVE` 重新编译即可（`mspSerialPush` 支持三种版本）。代价：上位机必须相应解析 v2 帧头，且与"只支持 v1 的第三方设备/图传"不兼容。
+- **务实建议**：上位机接收侧**同时实现 v1 和 v2 帧头解析器**（v1 用于收 OSD，v2 用于发命令），互不干扰；不要为了统一而要求 OSD 也走 v2。
+
+---
+
+## 10. 专题：上位机驾驶接管（MSP_SET_RAW_RC）控制频率建议
+
+> 场景：上位机通过**另一个串口**（或同一串口）向 FC 发送 `MSP_SET_RAW_RC(200)` 实现"驾驶接管"（override 遥控通道）。
+
+### 10.1 相关机制（本 fork）
+
+- 命令：`MSP_SET_RAW_RC = 200`，载荷 = `N × uint16`（小端），8 通道 = 16 字节，最多 18 通道；
+- FC 收到即调用 `rxMspFrameReceive()` 写入 `mspFrame[]`，RC 任务（1 kHz）下个周期生效；
+- **新鲜度窗口**：`src/main/rx/msp.c` 中 `RX_MSP_RC_FRAME_FRESH_MS = 300ms`——超过 300ms 没收到新帧，override 失效并回退遥控器/原通道。因此**发送周期必须远小于 300ms**（代码注释按 ~5Hz 速率的余量设计）。
+
+### 10.2 频率建议
+
+| 频率 | 周期 | 适用性 | 115200 波特率占用（8通道 v1 帧≈23B） |
+| --- | --- | --- | --- |
+| ≥ 10 Hz | ≤ 100 ms | **绝对下限**：必须保证 300ms 新鲜窗口内有足够余量（建议 100ms 内） | ~2% |
+| **50 Hz（推荐）** | **20 ms** | 接管手感已较平滑；波特率/CPU 开销小；留有 280ms 故障余量 | ~10% |
+| **100 Hz（高要求）** | **10 ms** | 接近 ELRS/标准遥控链路速率，手感最好；适合竞速/对时延敏感 | ~20% |
+| > 200 Hz | < 5 ms | 不建议：收益递减，且挤占同口 OSD/遥测带宽，115200 下已到帧间冲突风险区 | >40% |
+
+**建议默认 50~100 Hz（10~20 ms）**：
+- 满足 300ms 新鲜度约束（50Hz 下余量 280ms，丢 2~3 帧也不回退）；
+- 控制分辨率远高于飞手操作带宽（人手指令 <10Hz），已足够平滑；
+- 若该串口同时承担 OSD 推送/遥测等流量，取 50Hz 更稳；若专用接管口，取 100Hz。
+
+### 10.3 其它注意事项
+
+- **波特率**：接管口建议 ≥115200；若同口还有 OSD 推送，建议 230400/460800，避免 OSD 帧挤占 RC 帧时延；
+- **时间戳/丢帧**：建议上位机带帧序号或时间戳，便于 FC 端（如将来加"帧间超时回退"）判定连续性；目前 FC 只按"最后收到时间"判断；
+- **回退语义**：停止发送后 300ms 内仍是"最后一帧 MSP 值"（本 fork 行为，见 `msp_override_update.md`），如需"失联立即回退遥控器"，需调整 `RX_MSP_RC_FRAME_FRESH_MS` 或接入 `rxMspIsRcChannelRefresh()` 判定；
+- **与 OSD 共口**：若接管和 OSD 走同一串口，FC 侧该口须同时带 `FUNCTION_MSP`（MSP 接管）与 `FUNCTION_VTX_MSP`（OSD 推送），注意显示端也要按 cmd 号过滤（OSD 只处理 182，接管只处理 200）。
 
