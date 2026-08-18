@@ -58,8 +58,13 @@ typedef struct displayPortMspCommand_s {
 static int output(displayPort_t *displayPort, uint8_t cmd, uint8_t *buf, int len)
 {
     UNUSED(displayPort);
-
+    // patched msp v2, 2026.8.18
+#ifdef PATCH__USE_MSP_DISPLAYPORT_MSP_V2
+    return mspSerialPush(displayPortSerial, cmd, buf, len, MSP_DIRECTION_REPLY, MSP_V2_NATIVE);
+#else
     return mspSerialPush(displayPortSerial, cmd, buf, len, MSP_DIRECTION_REPLY, MSP_V1);
+#endif
+
 }
 
 static int heartbeat(displayPort_t *displayPort)
