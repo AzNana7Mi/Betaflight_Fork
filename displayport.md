@@ -397,3 +397,78 @@ static int heartbeat(displayPort_t *displayPort)
 - 渲染由 **attr 的 font bank 位（bits0-1，默认 bank=severity）** 决定用哪套 256 字符字库；
 - **无 UTF-8/宽字符/转义**：字节按字库原样查表渲染。上位机若不自带与 BF 默认字库一致的字形，可配合 `FONTCHAR_WRITE(7)`（§4.5）接收字库，否则至少保证 ASCII 段可读、符号段用占位符。
 
+
+---
+
+## 14. 专题：为什么设置 MSP DisplayPort 后 SET_RAW_RC 失效、但 MSP_API_VERSION 正常？
+
+### 14.1 现象与结论
+
+> 现象：配置了 MSP DisplayPort（把某 UART 设为 VTX MSP）之后，上位机发 `MSP_SET_RAW_RC(200)` 不生效，但查询 `MSP_API_VERSION(1)` 照常返回。
+
+**结论：MSP_API_VERSION（out 命令）和 MSP_SET_RAW_RC（in 命令）走的是完全相同的"接收→解析→分发"路径；两者表现不同，说明问题不在协议解析，而在"这条 UART 上是否建立了 MSP 端口"或"RC 数据是否真正被使用"。按可能性排序如下。**
+
+### 14.2 根因A（最常见）：该 UART 只配了 `FUNCTION_VTX_MSP`，没有 `FUNCTION_MSP`
+
+MSP 端口是按功能掩码**逐个分配**的（`msp_serial.c:56 mspSerialAllocatePorts`）：
+
+```c
+const serialPortConfig_t *portConfig = findSerialPortConfig(FUNCTION_MSP);   // 只匹配 functionMask 含 FUNCTION_MSP 的口
+...
+serialPort_t *serialPort = openSerialPort(portConfig->identifier, FUNCTION_MSP, ...);  // 打开失败则此口无 MSP
+```
+
+- `findSerialPortConfig` 判定是 `candidate->functionMask & function`（`serial.c:456`）。
+- **如果该口 functionMask 只有 `FUNCTION_VTX_MSP`（配置器只勾了 "VTX (MSP, DisplayPort)"）→ `mspSerialAllocatePorts` 根本不为它建立 MSP 端口** → 进来的 `$M<` 帧无人处理 → **任何** in 命令（含 SET_RAW_RC）都失效；
+- 而 MSP_API_VERSION 照常工作，是因为它回答在**另一条** MSP 端口上（USB VCP 默认 `FUNCTION_MSP`，或另一个勾了 MSP 的 UART），并不经过 DisplayPort 口；
+- 佐证：`validateAndFixConfig()`（`config.c:566-578`）要求端口**同时带** `FUNCTION_VTX_MSP | FUNCTION_MSP` 才把该口选为 `displayPortSerial`；目标定义 `MSP_DISPLAYPORT_UART` 时 `serial.c:361-366` 会强制写成两个位都置位。**结论：显示口上"收 OSD + 收 SET_RAW_RC"必须让该口同时具备两个功能。**
+
+### 14.3 根因B：帧能解析、有 ACK，但 RC 通道不响应
+
+即使根因A排除，`SET_RAW_RC` 也只在以下条件之一成立时才有实际效果：
+
+1. `USE_RX_MSP` 必须编译（默认在 `src/main/target/common_pre.h:400` 开启；若产品裁剪掉，`msp.c:2887 case MSP_SET_RAW_RC` 变空壳，只回 ACK 不改通道）；
+2. RC 源必须是 MSP，或 override 生效：
+   - 常规：`serialrx_provider = MSP`（`rx.c:390-395` → `rxMspReadRawRC` 直接用 `mspFrame[]`）；
+   - 本 fork：`BOXMSPOVERRIDE` 模式 + `msp_override_channels_mask`（`rx/msp_override.c:30-43`、`rx.c:630/728`）——只覆盖被屏蔽的通道，其余仍走遥控器；
+   - 两者都不满足 → 帧解析成功、ACK 正常，但通道不动。
+
+### 14.4 根因C：同一 UART 被其它功能先"独占打开"
+
+`serial.c:595-599`：一个 UART 同一时刻只能被**一个功能**打开：
+
+```c
+serialPortUsage_t *usage = findSerialPortUsageByIdentifier(identifier);
+if (!usage || usage->function != FUNCTION_NONE) return NULL;   // 已被占用 → MSP 口打开失败
+```
+
+- 初始化顺序：`vtxMspInit()`（`init.c:885`，本身不 open 端口、借用 MSP 口推送）→ `mspSerialInit()`（`init.c:920`，`mspSerialAllocatePorts` 以 FUNCTION_MSP 打开）。**只要顺序在前面的子系统（CRSF 接收机、遥测、GPS…）先打开了同一 UART，MSP 口就建不起来** → 症状与根因A相同（无 MSP 口、无 ACK）。
+- 因此：`FUNCTION_VTX_MSP` 与 `FUNCTION_MSP` 可以共存；但**不要**把该 UART 同时再配 `SERIAL_RX` / `TELEMETRY` / `GPS`。
+
+### 14.5 根因D（常见误解，实际不是原因）
+
+`msp_serial.c:549-552` 对 DisplayPort 口"不评估非 MSP 数据"（跳过 CLI `#`、引导字符 `R` 等），但 **`$M<` 的 MSP 帧照常进入 `mspProcessPacket` 解析**。所以这条逻辑不会让 SET_RAW_RC 失效——反过来，MSP_API_VERSION 能回，正说明 MSP 帧解析是通的。
+
+### 14.6 诊断步骤（先定位再改）
+
+| 步骤 | 操作 | 判读 |
+| --- | --- | --- |
+| 1 | 逻辑分析仪抓该 UART 的 FC 侧 RX | 上位机是否真的发出 `$M<` + size + `0xC8`(200)？没有→上位机问题 |
+| 2 | 看 FC 是否回 ACK（`$M>` size=0 cmd=200） | 有 ACK→根因A/C排除，跳到步骤4；无 ACK→根因A或C |
+| 3 | 检查该口 functionMask 是否含 `FUNCTION_MSP` | 不含→根因A |
+| 4 | 检查 `serialrx_provider` / BOXMSPOVERRIDE 是否生效 | 都没生效→根因B |
+| 5 | 检查同一 UART 是否还配了 RX/TELEMETRY/GPS | 有→根因C |
+
+### 14.7 修改位置（精确到行）
+
+| 场景 | 修改 |
+| --- | --- |
+| 根因A（端口缺 `FUNCTION_MSP`） | ① 配置器端口页把该口**同时**勾 "MSP" 与 "VTX (MSP, DisplayPort)"；② 或目标固件加 `#define MSP_DISPLAYPORT_UART xxx`（`serial.c:361-366` 自动强制 `FUNCTION_VTX_MSP\|FUNCTION_MSP`）；③ 若产品固件把 `serial.c:364` 改成只留 VTX_MSP，改回 `displayPortUartConfig->functionMask = FUNCTION_VTX_MSP | FUNCTION_MSP;` |
+| 根因B（RC 不生效） | CLI：`serialrx_provider = MSP`；或用 `BOXMSPOVERRIDE` + 配 `msp_override_channels_mask`；确认 `common_pre.h:400` 的 `USE_RX_MSP` 未被裁剪 |
+| 根因C（端口被独占） | 该 UART 不要再配 `SERIAL_RX/TELEMETRY/GPS`；或在 `msp_serial.c:56-90 mspSerialAllocatePorts` 中对该 identifier 复用已打开的端口句柄（绕过 `openSerialPort` 的独占限制），并加 `#include "io/serial.h"` 使用 `findSerialPortUsageByPort` 复用 |
+| 与"免开UART的MSPOSD"产品固件叠加 | 确认产品固件强制端口掩码时写的是 `FUNCTION_VTX_MSP \| FUNCTION_MSP` 两位（`serial.c:364`），而不是只写 VTX_MSP |
+
+### 14.8 与 §12 的衔接
+
+若你的上位机**接收 OSD 与发送 SET_RAW_RC 共用同一 UART**，正确配置是：该口 `functionMask = FUNCTION_VTX_MSP | FUNCTION_MSP`（配置器两个都勾 / 目标定义 `MSP_DISPLAYPORT_UART`），并满足 §14.3 的 RC 生效条件；此时收 OSD（`$M>` cmd=182）与发接管（`$M<` cmd=200）在同一端口双向共存，FC 侧零改动。
+
