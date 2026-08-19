@@ -36,6 +36,7 @@
 
 #include "io/displayport_msp.h"
 
+#include "../../config/configs/RP_405/config.h"
 #include "msp/msp.h"
 #include "msp/msp_protocol.h"
 #include "msp/msp_serial.h"
@@ -43,6 +44,7 @@
 #include "osd/osd.h"
 
 #include "pg/vcd.h"
+#include "rx/rx.h"
 
 static displayPort_t mspDisplayPort;
 static serialPortIdentifier_e displayPortSerial;
@@ -59,7 +61,7 @@ static int output(displayPort_t *displayPort, uint8_t cmd, uint8_t *buf, int len
 {
     UNUSED(displayPort);
     // patched msp v2, 2026.8.18
-#ifdef PATCH__USE_MSP_DISPLAYPORT_MSP_V2
+#ifdef PATCH_20260818_ALLOW_DISPLAYPORT_MSP_V2
     return mspSerialPush(displayPortSerial, cmd, buf, len, MSP_DIRECTION_REPLY, MSP_V2_NATIVE);
 #else
     return mspSerialPush(displayPortSerial, cmd, buf, len, MSP_DIRECTION_REPLY, MSP_V1);
@@ -69,7 +71,30 @@ static int output(displayPort_t *displayPort, uint8_t cmd, uint8_t *buf, int len
 
 static int heartbeat(displayPort_t *displayPort)
 {
+    // 扩展displayport,附带传输数据
+#ifndef PATCH_20260818_DISPLAYPORT_EXTENSION // 如果没有#define这个补丁, 就用原版
     uint8_t subcmd[] = { MSP_DP_HEARTBEAT };
+#else
+    #include "rx/rx.h"
+    #ifndef PATCH_20260818_MAX_RC_CHANNELS
+        #define PATCH_20260818_MAX_RC_CHANNELS 8 // 默认为8通道 roll pitch yaw throttle + 4*AUX
+    #endif
+
+    uint8_t subcmd[PATCH_20260818_MAX_RC_CHANNELS*2 + 2];
+    subcmd[0] = MSP_DP_HEARTBEAT;
+    subcmd[1] = PATCH_20260818_MAX_RC_CHANNELS;
+    // 原版有18个通道, 不需要全部传输, 这个在config里面定义
+    // 补丁自己用到的通道, 减少通信时间
+    int i = 0;
+    for (;i<PATCH_20260818_MAX_RC_CHANNELS;i++)
+    {
+        uint8_t low = (uint16_t) rcData[i] & 0xff;
+        uint8_t high = ((uint16_t)rcData[i]) >> 8 & 0xff;
+        subcmd[i*2+2]=low;
+        subcmd[i*2+3]=high;
+    }
+#endif
+
 
     // heartbeat is used to:
     // a) ensure display is not released by MW OSD software
