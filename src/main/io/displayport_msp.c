@@ -36,7 +36,8 @@
 
 #include "io/displayport_msp.h"
 
-#include "../../config/configs/RP_405/config.h"
+
+#include "flight/position.h"
 #include "msp/msp.h"
 #include "msp/msp_protocol.h"
 #include "msp/msp_serial.h"
@@ -44,7 +45,12 @@
 #include "osd/osd.h"
 
 #include "pg/vcd.h"
+
+#ifdef PATCH_20260818_DISPLAYPORT_EXTENSION
 #include "rx/rx.h"
+#include "flight/imu.h"
+#include "flight/position.h"
+#endif
 
 static displayPort_t mspDisplayPort;
 static serialPortIdentifier_e displayPortSerial;
@@ -75,7 +81,7 @@ static int heartbeat(displayPort_t *displayPort)
 #ifndef PATCH_20260818_DISPLAYPORT_EXTENSION // 如果没有#define这个补丁, 就用原版
     uint8_t subcmd[] = { MSP_DP_HEARTBEAT };
 #else
-    #include "rx/rx.h"
+
     #ifndef PATCH_20260818_MAX_RC_CHANNELS
         #define PATCH_20260818_MAX_RC_CHANNELS 8 // 默认为8通道 roll pitch yaw throttle + 4*AUX
     #endif
@@ -116,11 +122,35 @@ static int release(displayPort_t *displayPort)
     return output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd));
 }
 
+#ifdef PATCH_20260818_DISPLAYPORT_EXTENSION
+#include "flight/imu.h"
+#endif
 static int clearScreen(displayPort_t *displayPort, displayClearOption_e options)
 {
     UNUSED(options);
 
+    //添加roll, pitch, yaw, 海拔高度, 高度变化率
+#ifndef PATCH_20260818_DISPLAYPORT_EXTENSION
     uint8_t subcmd[] = { MSP_DP_CLEAR_SCREEN };
+#else
+
+    uint8_t subcmd[13];
+    subcmd[0] = MSP_DP_CLEAR_SCREEN;
+    // 0.1deg
+    subcmd[1] = (int16_t)attitude.values.roll & 0xff;
+    subcmd[2] = (int16_t)attitude.values.roll >> 8 & 0xff;
+    subcmd[3] = (int16_t)attitude.values.pitch & 0xff;
+    subcmd[4] = (int16_t)attitude.values.pitch >> 8 & 0xff;
+    subcmd[5] = (int16_t)DECIDEGREES_TO_DEGREES(attitude.values.yaw) & 0xff;
+    subcmd[6] = (int16_t)DECIDEGREES_TO_DEGREES(attitude.values.yaw) >> 8 & 0xff;
+    subcmd[7] = (int32_t)getEstimatedAltitudeCm() & 0xff;
+    subcmd[8] = (int32_t)getEstimatedAltitudeCm() >> 8 & 0xff;
+    subcmd[9] = (int32_t)getEstimatedAltitudeCm() >> 16 & 0xff;
+    subcmd[10] = (int32_t)getEstimatedAltitudeCm() >> 24 & 0xff;
+    subcmd[11] = (int16_t)getEstimatedVario() & 0xff;
+    subcmd[12] = (int16_t)getEstimatedVario() >> 8 & 0xff;
+
+#endif
 
     return output(displayPort, MSP_DISPLAYPORT, subcmd, sizeof(subcmd));
 }
