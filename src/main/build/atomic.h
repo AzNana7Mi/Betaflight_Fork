@@ -23,6 +23,8 @@
 #include <stdint.h>
 
 #if !defined(UNIT_TEST)
+
+#ifndef RISC_V
 // BASEPRI manipulation functions
 // only set_BASEPRI is implemented in device library. It does always create memory barrier
 // missing versions are implemented here
@@ -38,6 +40,30 @@ __attribute__( ( always_inline ) ) static inline void __set_BASEPRI_MAX_nb(uint3
 {
    __ASM volatile ("\tMSR basepri_max, %0\n" : : "r" (basePri) );
 }
+
+#else 
+
+#if defined(CH32H4) 
+
+#define PFIC_ITHRESDR_ADDR    (0xE000E040)
+#define PFIC_ITHRESDR         *((volatile uint32_t *)PFIC_ITHRESDR_ADDR)
+
+__attribute__( ( always_inline ) ) static inline void __set_BASEPRI_nb(uint32_t basePri)
+{
+    PFIC_ITHRESDR = basePri & 0xF0;
+    asm("fence");
+}
+
+__attribute__( ( always_inline ) ) static inline void __set_BASEPRI_MAX_nb(uint32_t basePri)
+{
+    uint32_t cur_tmp = PFIC_ITHRESDR & 0xF0;
+    if(cur_tmp < (basePri & 0xF0)) PFIC_ITHRESDR = basePri & 0xF0;
+    asm("fence");
+}
+
+#endif
+
+#endif
 
 #endif
 
@@ -84,6 +110,8 @@ static inline uint8_t __basepriSetRetVal(uint8_t prio)
 }
 
 #else
+
+#ifndef RISC_V
 // ARM BASEPRI manipulation
 
 // restore BASEPRI (called as cleanup function), with global memory barrier
@@ -111,6 +139,47 @@ static inline uint8_t __basepriSetRetVal(uint8_t prio)
     __set_BASEPRI_MAX_nb(prio);
     return 1;
 }
+
+#else
+// restore BASEPRI (called as cleanup function), with global memory barrier
+static inline void __basepriRestoreMem(uint8_t *val)
+{
+    PFIC_ITHRESDR = (*val) & 0xF0;
+    asm("fence");
+}
+
+// set BASEPRI_MAX, with global memory barrier, returns true
+static inline uint8_t __basepriSetMemRetVal(uint8_t prio)
+{
+    // __set_BASEPRI_MAX(prio);
+        
+    uint32_t cur_tmp = PFIC_ITHRESDR & 0xF0;
+    if(cur_tmp < (prio & 0xF0)) PFIC_ITHRESDR = prio & 0xF0;
+    asm("fence");
+    return 1;
+}
+
+// restore BASEPRI (called as cleanup function), no memory barrier
+static inline void __basepriRestore(uint8_t *val)
+{
+    __set_BASEPRI_nb(*val);
+}
+
+// set BASEPRI_MAX, no memory barrier, returns true
+static inline uint8_t __basepriSetRetVal(uint8_t prio)
+{
+    __set_BASEPRI_MAX_nb(prio);
+    return 1;
+}
+
+static inline uint32_t  __get_BASEPRI(void)
+{
+    uint32_t val = PFIC_ITHRESDR & 0xF0;
+    asm("fence");
+    return val;
+}
+
+#endif
 
 #endif
 
@@ -149,7 +218,7 @@ static inline uint8_t __basepriSetRetVal(uint8_t prio)
 #define ATOMIC_BARRIER_LEAVE(dataPtr, refStr)                              \
     __asm__ volatile ("\t# barrier (" refStr ") leave\n" : "m" (*(dataPtr)))
 
-#if defined(__clang__)
+#if defined(__clang__) && defined(__APPLE__)
 // CLang version, using Objective C-style block
 // based on https://stackoverflow.com/questions/24959440/rewrite-gcc-cleanup-macro-with-nested-function-for-clang
 typedef void (^__cleanup_block)(void);
@@ -160,6 +229,16 @@ static inline void __do_cleanup(__cleanup_block * b) { (*b)(); }
     ATOMIC_BARRIER_ENTER(__UNIQL(__barrier), #data);                    \
     __cleanup_block __attribute__((cleanup(__do_cleanup), __unused__)) __UNIQL(__cleanup) = \
         ^{  ATOMIC_BARRIER_LEAVE(__UNIQL(__barrier), #data); };         \
+    do {} while(0)                                                      \
+/**/
+#elif defined(__clang__)
+// Clang on non-Apple: use nested function cleanup (clang supports it in C mode)
+#define ATOMIC_BARRIER(data)                                            \
+    __extension__ void  __UNIQL(__barrierEnd)(typeof(data) **__d) {     \
+         ATOMIC_BARRIER_LEAVE(*__d, #data);                             \
+    }                                                                   \
+    typeof(data) __attribute__((__cleanup__(__UNIQL(__barrierEnd)))) *__UNIQL(__barrier) = &data; \
+    ATOMIC_BARRIER_ENTER(__UNIQL(__barrier), #data);                    \
     do {} while(0)                                                      \
 /**/
 #else

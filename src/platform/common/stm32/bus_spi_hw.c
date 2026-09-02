@@ -113,6 +113,11 @@ uint16_t spiCalculateDivider(uint32_t freq)
     }
 
     uint32_t spiClk = system_core_clock / 2;
+#elif defined(CH32H4)
+    if(freq > 36000000){
+        freq = 36000000;
+    }
+    uint32_t spiClk = HCLKClock;    
 #else
 #error "Base SPI clock not defined for this architecture"
 #endif
@@ -138,6 +143,12 @@ uint32_t spiCalculateClock(uint16_t spiClkDivisor)
     if ((spiClk / spiClkDivisor) > 36000000){
         return 36000000;
     }
+#elif defined(CH32H4)
+    uint32_t spiClk = HCLKClock;
+
+    if ((spiClk / spiClkDivisor) > 36000000){
+        return 36000000;
+    }    
 #else
 #error "Base SPI clock not defined for this architecture"
 #endif
@@ -199,7 +210,7 @@ void spiInitBusDMA(void)
 #endif
 
                 dmaEnable(dmaTxIdentifier);
-#if defined(USE_ATBSP_DRIVER)
+#if defined(USE_ATBSP_DRIVER) || defined(USE_CHBSP_DRIVER)
                 dmaMuxEnable(dmaTxIdentifier,dmaTxChannelSpec->dmaMuxId);
 #endif
                 break;
@@ -237,7 +248,7 @@ void spiInitBusDMA(void)
 #endif
 
                 dmaEnable(dmaRxIdentifier);
-#if defined(USE_ATBSP_DRIVER)
+#if defined(USE_ATBSP_DRIVER) || defined(USE_CHBSP_DRIVER)
                 dmaMuxEnable(dmaRxIdentifier,dmaRxChannelSpec->dmaMuxId);
 #endif
                 break;

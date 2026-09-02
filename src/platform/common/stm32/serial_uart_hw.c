@@ -78,6 +78,9 @@ static void enableRxIrq(const uartHardware_t *hardware)
             .NVIC_IRQChannelCmd = ENABLE,
         };
         NVIC_Init(&nvicInit);
+#elif defined(CH32H4)
+        NVIC_SetPriority(hardware->irqn,hardware->rxPriority);
+        NVIC_EnableIRQ(hardware->irqn);        
 #else
 # error "Unhandled MCU type"
 #endif
@@ -137,6 +140,7 @@ uartPort_t *serialUART(uartDevice_t *uartdev, uint32_t baudRate, portMode_e mode
         // pull direction
         const serialPullMode_t pull = serialOptions_pull(options);
 #if defined(STM32F7) || defined(STM32H5) || defined(STM32C5) || defined(STM32H7) || defined(STM32G4) || defined(STM32N6) || defined(APM32F4) || defined(X32M7)
+        // Note: APM32F4 is different from STM32F4 here
         const ioConfig_t ioCfg = IO_CONFIG(
             pushPull ? GPIO_MODE_AF_PP : GPIO_MODE_AF_OD,
             GPIO_SPEED_FREQ_HIGH,
@@ -149,6 +153,10 @@ uartPort_t *serialUART(uartDevice_t *uartdev, uint32_t baudRate, portMode_e mode
             pushPull ? GPIO_OUTPUT_PUSH_PULL : GPIO_OUTPUT_OPEN_DRAIN,
             ((const gpio_pull_type[]){GPIO_PULL_NONE, GPIO_PULL_DOWN, GPIO_PULL_UP})[pull]
         );
+#elif defined(CH32H4)
+        (void) pushPull;
+        (void) pull;
+        const ioConfig_t ioCfg = IOCFG_AF_PP;        
 #elif defined(STM32F4)
         // UART inverter is not supproted on F4, but keep it in line with other CPUs
         // External inverter in bidir mode would be quite problematic anyway
@@ -311,7 +319,7 @@ void uartEnableTxInterrupt(uartPort_t *uartPort)
 {
 #if defined(USE_HAL_DRIVER)
     LL_USART_EnableIT_TXE((USART_TypeDef *)uartPort->USARTx);
-#elif defined(USE_ATBSP_DRIVER)
+#elif defined(USE_ATBSP_DRIVER) 
     usart_interrupt_enable((usart_type *)uartPort->USARTx, USART_TDBE_INT, TRUE);
 #elif defined(X32M7)
     USART_ConfigInt((USART_TypeDef *)uartPort->USARTx, USART_INT_TXDE, ENABLE);

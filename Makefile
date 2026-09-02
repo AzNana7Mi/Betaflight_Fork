@@ -211,6 +211,16 @@ EXTRA_LD_FLAGS  :=
 #
 DEBUG_MIXED = no
 
+# Link-time optimisation is enabled by default. An {mcu}.mk can set "LTO := no"
+# (e.g. for an XIP / run-from-RAM layout that relies on per-function sections)
+# to strip the LTO flags from every optimisation profile and the link.
+LTO ?= yes
+
+# Promotion of float to double is treated as an error by default. An {mcu}.mk can
+# set "DOUBLE_PROMOTION := no" to disable the diagnostic entirely
+# (-Wno-double-promotion) instead.
+DOUBLE_PROMOTION ?= yes
+
 ifeq ($(DEBUG),INFO)
 DEBUG_MIXED = yes
 endif
@@ -318,6 +328,23 @@ endif
 #
 
 #
+# Resolve per-family build toggles now that the {mcu}.mk has been included.
+#
+
+# Disabling LTO routes its flags through CFLAGS_DISABLED so they are stripped
+# from every optimisation profile (CC_*_OPTIMISATION) and from LTO_FLAGS/LD_FLAGS.
+ifeq ($(LTO),no)
+CFLAGS_DISABLED += -flto=auto -fuse-linker-plugin
+endif
+
+# Select whether double-promotion is an error (default) or disabled entirely.
+ifeq ($(DOUBLE_PROMOTION),no)
+WARN_DOUBLE_PROMOTION := -Wno-double-promotion
+else
+WARN_DOUBLE_PROMOTION := -Wdouble-promotion
+endif
+
+#
 # Tool options.
 #
 CC_DEBUG_OPTIMISATION   := $(OPTIMISE_DEFAULT)
@@ -350,7 +377,7 @@ CFLAGS     += $(ARCH_FLAGS) \
               $(addprefix -isystem,$(SYS_INCLUDE_DIRS)) \
               $(DEBUG_FLAGS) \
               -std=gnu17 \
-              -Wall -Wextra -Werror -Wunsafe-loop-optimizations -Wdouble-promotion \
+              -Wall -Wextra -Werror -Wunsafe-loop-optimizations $(WARN_DOUBLE_PROMOTION) \
               $(EXTRA_WARNING_FLAGS) \
               -ffunction-sections \
               -fdata-sections \
@@ -709,20 +736,38 @@ zip: $(TARGET_HEX)
 $(AUTOHYDRATE_STAMPS):
 	@echo "Skipping submodule hydration (disabled): $(@:/.git=)"
 
+# Drop .d files whose recorded source path no longer exists. The most
+# common trigger is pulling across a source-move commit (e.g. promoting
+# an embedded vendor tree to a submodule) — gcc's -MMD pinned the .o to
+# the previous path, and make then bails with "No rule to make target
+# <old-path>" before the compiler ever runs to regenerate the .d. Cheap
+# scan: just stat the first .c prereq the .d declares.
+.PHONY: clean-stale-deps
+clean-stale-deps:
+	$(V1) if [ -d "$(OBJECT_DIR)" ]; then \
+	    find "$(OBJECT_DIR)" -name '*.d' 2>/dev/null | while IFS= read -r dfile; do \
+	        src=$$(awk '{ for (i=1; i<=NF; i++) if ($$i ~ /\.c$$/) { print $$i; exit } }' "$$dfile" 2>/dev/null); \
+	        if [ -n "$$src" ] && [ ! -f "$$src" ]; then \
+	            echo "Removing stale dependency file: $$dfile (source moved: $$src)"; \
+	            $(RM) "$$dfile"; \
+	        fi; \
+	    done; \
+	fi
+
 .PHONY: binary
-binary: $(PLATFORM_SDK_STAMP) $(AUTOHYDRATE_STAMPS)
+binary: $(PLATFORM_SDK_STAMP) $(AUTOHYDRATE_STAMPS) clean-stale-deps
 	$(V1) $(MAKE) $(MAKE_PARALLEL) $(TARGET_BIN)
 
 .PHONY: hex
-hex: $(PLATFORM_SDK_STAMP) $(AUTOHYDRATE_STAMPS)
+hex: $(PLATFORM_SDK_STAMP) $(AUTOHYDRATE_STAMPS) clean-stale-deps
 	$(V1) $(MAKE) $(MAKE_PARALLEL) $(TARGET_HEX)
 
 .PHONY: uf2
-uf2: $(PLATFORM_SDK_STAMP) $(AUTOHYDRATE_STAMPS)
+uf2: $(PLATFORM_SDK_STAMP) $(AUTOHYDRATE_STAMPS) clean-stale-deps
 	$(V1) $(MAKE) $(MAKE_PARALLEL) $(TARGET_UF2)
 
 .PHONY: exe
-exe: $(AUTOHYDRATE_STAMPS)
+exe: $(AUTOHYDRATE_STAMPS) clean-stale-deps
 	$(V1) $(MAKE) $(MAKE_PARALLEL) $(TARGET_EXE)
 
 # FWO (Firmware Output) is the default output for building the firmware
